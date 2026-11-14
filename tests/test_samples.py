@@ -86,6 +86,21 @@ class SampleFixtureTest(unittest.TestCase):
                 (SAMPLES / "transactions_conflict_rejected.csv").read_bytes())
         self.assertEqual(getattr(ctx.exception, "code", None), "batch_rejected")
 
+    def test_separator_collision_samples_attribute_correct_accounts(self):
+        """The shipped collision fixture: account id contains the sd1 field
+        separator ``\x1f``. Features must belong to the literal account."""
+        self.svc.upload_transactions(
+            "txn_collision.csv",
+            (SAMPLES / "transactions_separator_collision.csv").read_bytes())
+        self.svc.upload_samples(
+            "samples_collision.csv",
+            (SAMPLES / "samples_separator_collision.csv").read_bytes())
+        rows = self.run_report()
+        self.assertEqual(rows["S901"]["account_id"], "A\x1fB")
+        self.assertEqual(rows["S901"]["txn_count_7d"], "1")
+        self.assertEqual(rows["S901"]["txn_amount_7d"], "100.00")
+        self.assertEqual(rows["S902"]["txn_amount_7d"], "40.00")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 data/
 tests/
 samples/
+scripts/
 *.md
 .git/
 .gitignore

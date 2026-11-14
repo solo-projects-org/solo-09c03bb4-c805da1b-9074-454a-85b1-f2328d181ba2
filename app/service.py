@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import features
 from .config import Settings
-from .csvparse import BatchRejected, parse_samples, parse_transactions
+from .csvparse import BatchRejected, ParseError, parse_samples, parse_transactions
 from .db import Database
 
 UTC = timezone.utc
@@ -29,6 +29,10 @@ class ConflictError(Exception):
         super().__init__(message)
         self.message = message
         self.existing_batch_id = existing_batch_id
+
+
+class SourceVerificationError(Exception):
+    """The pinned source cannot be authenticated against the original files."""
 
 
 def _hash_file(path: Path) -> str:
@@ -215,7 +219,7 @@ class AppService:
                 raise ConflictError("尚无已上传样本，无法生成报告。")
             if txn_hi == 0:
                 raise ConflictError("尚无已上传交易，无法生成报告。")
-            digest, txn_rows, sample_rows = features.source_digest(
+            digest, txn_rows, sample_rows = features.source_digest_v2(
                 conn, txn_hi, sample_hi)
             manifest = {
                 "txn_batch_hi": txn_hi,
@@ -224,6 +228,7 @@ class AppService:
                 "sample_batches": self._batch_manifest(conn, "samples", sample_hi),
                 "transaction_rows": txn_rows,
                 "sample_rows": sample_rows,
+                "digest_format": features.DIGEST_FORMAT_V2,
                 "source_digest": digest,
                 "window_seconds": features.WINDOW_SECONDS,
                 "spec": "latest revision with ingested_at <= audit_at; count "
@@ -249,6 +254,126 @@ class AppService:
                 "WHERE kind = ? AND id <= ? ORDER BY id", (kind, hi))
         ]
 
+    # ------------------------------------------------------------------ #
+    # Source authentication for pinned reports
+    # ------------------------------------------------------------------ #
+    def check_source_integrity(self, conn, manifest: dict) -> None:
+        """Prove the pinned source is still exactly what the report froze.
+
+        ``sd2`` manifests: the length-prefixed digest is unambiguous, so
+        recomputing it over the stored rows is sufficient.
+
+        Legacy ``sd1`` manifests: the digest joins fields with ``\\x1f`` and
+        cannot detect a re-split of ``sample_id``/``account_id`` (or
+        ``event_id``/``account_id``) when values contain that control
+        character. We therefore additionally authenticate every pinned
+        upload with its registered SHA-256 fingerprint and re-parse the
+        original file, comparing each stored row field-by-field. Any
+        mismatch raises :class:`SourceVerificationError` and the
+        regeneration/background build must be refused.
+        """
+        txn_hi = manifest["txn_batch_hi"]
+        sample_hi = manifest["sample_batch_hi"]
+        fmt = features.manifest_digest_format(manifest)
+        if fmt == features.DIGEST_FORMAT_V2:
+            digest_now, _, _ = features.source_digest_v2(conn, txn_hi, sample_hi)
+            if digest_now != manifest["source_digest"]:
+                raise SourceVerificationError(
+                    "冻结源数据校验失败（sd2 摘要）：已入库批次内容与冻结清单不一致。")
+            return
+        digest_now, _, _ = features.source_digest(conn, txn_hi, sample_hi)
+        if digest_now != manifest["source_digest"]:
+            raise SourceVerificationError(
+                "冻结源数据校验失败（sd1 摘要）：已入库批次内容被篡改。")
+        self._verify_against_registered_files(conn, manifest)
+
+    def _verify_against_registered_files(self, conn, manifest: dict) -> None:
+        problems: list[str] = []
+        for key, kind in (("txn_batches", "transactions"),
+                          ("sample_batches", "samples")):
+            for entry in manifest.get(key, []):
+                batch_id = entry["batch_id"]
+                label = f"批次 #{batch_id}（{entry.get('filename', '?')}）"
+                row = conn.execute(
+                    """SELECT id, kind, filename, byte_size, sha256,
+                              stored_path, stored_rows
+                       FROM batches WHERE id=?""", (batch_id,)).fetchone()
+                if row is None:
+                    problems.append(f"{label} 在库中不存在")
+                    continue
+                if row["kind"] != kind:
+                    problems.append(f"{label} 类型与登记不符")
+                    continue
+                if row["sha256"] != entry["sha256"]:
+                    problems.append(f"{label} 的登记指纹与批次元数据不一致")
+                    continue
+                path = Path(row["stored_path"])
+                if not path.is_file():
+                    problems.append(f"{label} 原始文件缺失，无法核验")
+                    continue
+                if _hash_file(path) != row["sha256"]:
+                    problems.append(f"{label} 原始文件指纹不匹配（文件已变化）")
+                    continue
+                try:
+                    data = path.read_bytes()
+                    if kind == "samples":
+                        self._check_sample_rows(conn, batch_id, data, label, problems)
+                    else:
+                        self._check_transaction_rows(conn, batch_id, data, label,
+                                                     problems)
+                except ParseError as exc:
+                    problems.append(f"{label} 原始文件无法重新解析：{exc.message}")
+        if problems:
+            raise SourceVerificationError(
+                "原始样本档核验失败：" + "；".join(problems))
+
+    @staticmethod
+    def _check_sample_rows(conn, batch_id: int, data: bytes,
+                           label: str, problems: list[str]) -> None:
+        parsed = parse_samples(data)
+        expected = [(s.sample_id, s.account_id, s.audit_at, s.label, s.row_number)
+                    for s in parsed.samples]
+        actual = [tuple(r) for r in conn.execute(
+            """SELECT sample_id, account_id, audit_at, label, row_number
+               FROM samples WHERE batch_id=? ORDER BY row_number""", (batch_id,))]
+        if expected != actual:
+            problems.append(
+                f"{label} 入库样本与原始文件不一致"
+                "（sample_id/account_id 可能被重新分界）")
+
+    @staticmethod
+    def _check_transaction_rows(conn, batch_id: int, data: bytes,
+                                label: str, problems: list[str]) -> None:
+        parsed = parse_transactions(data)
+        # Replay the ingest-time dedupe: within the file the first revision
+        # of (event_id, ingested_at) wins; rows already stored by an earlier
+        # batch are not re-stored for this one.
+        seen: set[tuple[str, int]] = set()
+        expected: list[tuple] = []
+        for t in parsed.transactions:
+            key = (t.event_id, t.ingested_at)
+            if key in seen:
+                continue
+            seen.add(key)
+            prior = conn.execute(
+                """SELECT 1 FROM transactions
+                   WHERE event_id=? AND ingested_at=? AND batch_id < ?""",
+                (t.event_id, t.ingested_at, batch_id)).fetchone()
+            if prior is not None:
+                continue
+            expected.append((t.event_id, t.account_id, t.occurred_at,
+                             t.ingested_at, t.amount_text, t.action,
+                             t.row_number))
+        actual = [tuple(r) for r in conn.execute(
+            """SELECT event_id, account_id, occurred_at, ingested_at,
+                      amount_text, action, row_number
+               FROM transactions WHERE batch_id=? ORDER BY row_number""",
+            (batch_id,))]
+        if expected != actual:
+            problems.append(
+                f"{label} 入库交易与原始文件不一致"
+                "（event_id/account_id 可能被重新分界）")
+
     def get_report(self, public_id: str) -> dict | None:
         with self.db.read() as conn:
             row = conn.execute(
@@ -256,6 +381,7 @@ class AppService:
             ).fetchone()
         if row is None:
             return None
+        manifest = json.loads(row["manifest_json"])
         out = {
             "report_id": row["public_id"],
             "status": row["status"],
@@ -266,7 +392,8 @@ class AppService:
             "output_bytes": row["output_bytes"],
             "output_sha256": row["output_sha256"],
             "error": row["error"],
-            "manifest": json.loads(row["manifest_json"]),
+            "manifest": manifest,
+            "digest_format": features.manifest_digest_format(manifest),
             "downloadable": False,
         }
         if row["status"] == "ready":
@@ -352,10 +479,10 @@ class AppService:
                 if row is None:
                     return
                 manifest = json.loads(row["manifest_json"])
-                digest_before, _, _ = features.source_digest(
-                    conn, row["txn_batch_hi"], row["sample_batch_hi"])
-                if digest_before != manifest["source_digest"]:
-                    raise RuntimeError("源数据与冻结清单不一致，拒绝生成。")
+                try:
+                    self.check_source_integrity(conn, manifest)
+                except SourceVerificationError as exc:
+                    raise RuntimeError(f"来源核验未通过，拒绝生成：{exc}") from exc
                 rows = features.compute_rows(
                     conn, row["txn_batch_hi"], row["sample_batch_hi"])
             payload = features.render_csv(rows)
@@ -420,17 +547,24 @@ class AppService:
     # Regeneration from the original version
     # ------------------------------------------------------------------ #
     def regenerate_report(self, public_id: str) -> dict:
-        """Re-run against the frozen high-watermarks, never current data."""
+        """Re-run against the frozen high-watermarks, never current data.
+
+        The frozen source must authenticate first: sd2 manifests via their
+        unambiguous digest, legacy sd1 manifests additionally via the
+        registered fingerprints of the original uploads plus a field-by-field
+        comparison of stored rows against those files. If the source cannot
+        be verified, the re-fetch is refused.
+        """
         report = self.get_report(public_id)
         if report is None:
             raise LookupError(public_id)
         manifest = report["manifest"]
         with self.db.write_transaction() as conn:
-            digest_now, _, _ = features.source_digest(
-                conn, manifest["txn_batch_hi"], manifest["sample_batch_hi"])
-            if digest_now != manifest["source_digest"]:
+            try:
+                self.check_source_integrity(conn, manifest)
+            except SourceVerificationError as exc:
                 raise ConflictError(
-                    "冻结源数据校验失败：已入库批次内容被篡改，无法按原版本重取。")
+                    f"来源核验未通过，无法按原版本重取：{exc}") from exc
             new_id = uuid.uuid4().hex
             conn.execute(
                 """INSERT INTO reports(public_id, status, txn_batch_hi,

@@ -1,7 +1,7 @@
 services:
   features:
     build: .
-    image: ptf-features:1.0.0
+    image: ptf-features:1.1.0
     container_name: ptf-features
     restart: unless-stopped
     ports:

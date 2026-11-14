@@ -22,7 +22,7 @@
 
 {% if r.status == 'failed' %}
 <div class="banner error">生成失败：{{ r.error }}<br>
-  源数据版本仍被锁定，可点击「按原版本重取」重试，不会混入期间补传。</div>
+  源数据版本仍被锁定；若来源核验通过，可点击「按原版本重取」重试，不会混入期间补传。</div>
 {% elif r.status in ('pending','running') %}
 <div class="banner info">报告正在按冻结版本生成，完成后此页会显示预览与下载入口。
   <a href="/reports/{{ r.report_id }}">刷新</a></div>
@@ -64,6 +64,8 @@
     <summary>查看批次与摘要</summary>
     <div class="manifest" style="margin-top:10px">
     <dl class="kv">
+      <dt>源摘要格式</dt>
+      <dd class="mono">{{ r.digest_format }}{% if r.digest_format == 'sd2' %}（长度前缀，区分字段边界）{% else %}（旧版；重取前须用登记指纹核验原始样本档）{% endif %}</dd>
       <dt>源数据摘要 (SHA-256)</dt>
       <dd class="mono">{{ r.manifest.source_digest }}</dd>
       <dt>交易行数（可见）</dt><dd>{{ r.manifest.transaction_rows }}</dd>

@@ -71,8 +71,34 @@ sample_id,account_id,audit_at,window_start_at,window_end_at,txn_count_7d,txn_amo
   一并冻结在报告清单里，页面可核对。
 - 报告先写临时文件、`fsync`、原子 `rename`，随后才把状态改为 `ready`。
   写盘/校验失败时状态为 `failed`，下载接口返回 409，不会暴露半成品。
-- “按原版本重取”会用冻结的高水位重跑，并在重跑前校验源数据摘要；
-  源数据若被篡改则拒绝重取。状态为 `failed` 或文件被删除/篡改时，均可这样恢复。
+- “按原版本重取”会用冻结的高水位重跑，重跑前先做**来源核验**（见下节）；
+  无法核实即拒绝重取。状态为 `failed` 或文件被删除/篡改时，均可这样恢复。
+
+## 来源核验（源摘要格式 sd1 / sd2）
+
+样本号、账户号等文本字段允许包含控制字符。旧版源摘要（`sd1`）把各字段用
+`U+001F` 连接后哈希：若字段值本身含该分隔符，库内两列被重新分界
+（如 `('S901','A␟B')` 变成 `('S901␟A','B')`）后**摘要字节流不变**，
+重取就会把交易算到另一账户。为此：
+
+- **新报告（sd2）**：源摘要改为逐字段长度前缀编码并自带格式标签
+  （`sd2:<hex>`，清单中记 `digest_format: "sd2"`），字段边界无歧义；
+  任何重新分界都会改变摘要，重算比对即可识破。
+- **旧报告（sd1 清单）重取及后台生成**：除重算 sd1 摘要外，还须用清单登记的
+  SHA-256 指纹核验每个原始上传档（文件在位且指纹一致），并把原档重新解析、
+  与库内行逐字段比对，确认入库样本/交易仍与原档一致。任一环失败即**拒绝重取**
+  （409）或将后台生成标记为 `failed`。
+- **已发布的旧报告**：只要输出文件通过自身 SHA-256 校验，仍可正常下载——
+  下载的是生成时冻结的产物，不受后续库内变化影响。
+- 核实通过的旧报告继续按原冻结批次生成，特征与首次发布完全一致。
+
+`samples/` 下的 `samples_separator_collision.csv` 与
+`transactions_separator_collision.csv` 演示了该碰撞（账户 `A␟B` 含真实
+`U+001F`）。一键演示：
+
+```bash
+python3 scripts/demo_separator_collision.py
+```
 
 ## 样例
 
@@ -84,6 +110,7 @@ sample_id,account_id,audit_at,window_start_at,window_end_at,txn_count_7d,txn_amo
 | `transactions_late.csv` | 迟到补录：E7 改期、E9/E10 审核后入库、E10 后续撤销、E11 改到窗外 |
 | `samples.csv` | 5 个样本（含无交易账户 C） |
 | `transactions_conflict_rejected.csv` | 同事件同入库时刻异值 → 整批拒收演示 |
+| `samples_separator_collision.csv` / `transactions_separator_collision.csv` | 账户含 `U+001F` 分隔符 → 源摘要碰撞与核验演示 |
 
 建议流程：上传 `transactions_base.csv` + `samples.csv` → 生成报告（得 S001=4 笔/280.00）→
 再上传 `transactions_late.csv` → **旧报告不变**，新报告 S002=3 笔/110.00。
@@ -97,7 +124,7 @@ sample_id,account_id,audit_at,window_start_at,window_end_at,txn_count_7d,txn_amo
 | POST | `/api/reports` | 冻结版本并排队生成；无数据返回 409 |
 | GET | `/api/reports`、`/api/reports/{id}` | 状态与冻结清单 |
 | GET | `/api/reports/{id}/download` | 未就绪/校验失败返回 409 |
-| POST | `/api/reports/{id}/regenerate` | 按原冻结版本重取 |
+| POST | `/api/reports/{id}/regenerate` | 按原冻结版本重取（先过来源核验，失败返回 409） |
 | GET | `/api/docs` | OpenAPI 文档 |
 
 ## 设计取舍
